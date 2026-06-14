@@ -1,0 +1,1181 @@
+<ac:structured-macro ac:name="toc">
+  <ac:parameter ac:name="printable">true</ac:parameter>
+  <ac:parameter ac:name="style">disc</ac:parameter>
+  <ac:parameter ac:name="maxLevel">3</ac:parameter>
+  <ac:parameter ac:name="outline">false</ac:parameter>
+  <ac:parameter ac:name="indent">15px</ac:parameter>
+</ac:structured-macro>
+
+<ac:layout>
+  <ac:layout-section ac:type="two_equal">
+    <ac:layout-cell>
+      <ac:structured-macro ac:name="info">
+        <ac:parameter ac:name="title">Document Information</ac:parameter>
+        <ac:rich-text-body>
+          <table>
+            <tbody>
+              <tr>
+                <th>Status</th>
+                <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">DRAFT v0.1</ac:parameter></ac:structured-macro></td>
+              </tr>
+              <tr><th>Scope</th><td>Oracle-to-Oracle CDC, 100 schemas / ~3 000 tables</td></tr>
+              <tr><th>Technology</th><td>Debezium &middot; Apache Kafka &middot; Oracle LogMiner</td></tr>
+              <tr><th>DB Versions</th><td>Legacy: Oracle <strong>12c</strong> &middot; New: Oracle <strong>19c</strong></td></tr>
+              <tr><th>Classification</th><td>Internal &mdash; Architecture</td></tr>
+              <tr><th>Owner</th><td>Architecture Team &mdash; eEFKA Digital Transformation</td></tr>
+            </tbody>
+          </table>
+        </ac:rich-text-body>
+      </ac:structured-macro>
+    </ac:layout-cell>
+    <ac:layout-cell>
+      <ac:structured-macro ac:name="note">
+        <ac:parameter ac:name="title">Key Numbers at a Glance</ac:parameter>
+        <ac:rich-text-body>
+          <ul>
+            <li><strong>~100 schemas</strong> across two Oracle databases</li>
+            <li><strong>~3 000 tables</strong> subject to CDC capture</li>
+            <li><strong>10&ndash;15 Debezium connectors</strong>, partitioned by functional domain</li>
+            <li><strong>&lt; 5 second</strong> target data freshness</li>
+            <li><strong>99.9 %</strong> pipeline uptime target</li>
+            <li><strong>7 years</strong> audit log retention (statutory)</li>
+          </ul>
+        </ac:rich-text-body>
+      </ac:structured-macro>
+    </ac:layout-cell>
+  </ac:layout-section>
+</ac:layout>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>1. Context &amp; Goals</h1>
+
+<p>eEFKA is migrating a large-scale Oracle-based legacy system to a modern application platform. During the transition period &mdash; which may span 12&ndash;24 months &mdash; both the legacy system and the new system must remain operational and data-consistent. Neither system can afford downtime, and citizen-facing operations (insurance contributions, pension calculations, employer registrations) must continue uninterrupted.</p>
+
+<h2>1.1 Migration Pattern</h2>
+
+<ac:structured-macro ac:name="info">
+  <ac:parameter ac:name="title">Strangler Fig Pattern</ac:parameter>
+  <ac:rich-text-body>
+    <p>The new application gradually takes ownership of functional domains one at a time. Until a domain is fully owned by the new system, the legacy system remains the <strong>system of record</strong> for that domain.</p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<table>
+  <thead>
+    <tr>
+      <th>Phase</th>
+      <th>Data Flow Direction</th>
+      <th>New App Role</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Phase 1</strong> &mdash; Legacy authoritative</td>
+      <td>Legacy &rarr; New</td>
+      <td>Read-only (validation)</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Blue</ac:parameter><ac:parameter ac:name="title">PLANNED</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td><strong>Phase 2</strong> &mdash; Domain handover</td>
+      <td>Bidirectional (with conflict rules)</td>
+      <td>Writes for owned domains</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Blue</ac:parameter><ac:parameter ac:name="title">PLANNED</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td><strong>Phase 3</strong> &mdash; Legacy archived</td>
+      <td>New &rarr; Legacy (archive only)</td>
+      <td>Fully authoritative</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Grey</ac:parameter><ac:parameter ac:name="title">FUTURE</ac:parameter></ac:structured-macro></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>1.2 Goals</h2>
+
+<table>
+  <thead>
+    <tr><th>Goal</th><th>Measurable Target</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Data freshness</td><td>Changes available in new DB within <strong>&lt; 5 seconds</strong> under normal load</td></tr>
+    <tr><td>Table coverage</td><td><strong>&ge; 99 %</strong> of actively-written tables captured</td></tr>
+    <tr><td>Data fidelity</td><td>Zero lost events; at-least-once delivery with idempotent sink</td></tr>
+    <tr><td>Availability</td><td>Sync pipeline uptime <strong>&ge; 99.9 %</strong></td></tr>
+    <tr><td>Schema evolution</td><td>DDL changes propagated and reconciled within <strong>1 business day</strong></td></tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>2. Scope</h1>
+
+<h2>2.1 In Scope</h2>
+<ul>
+  <li>Continuous CDC of <strong>~3 000 tables</strong> across <strong>~100 schemas</strong> in the legacy Oracle database</li>
+  <li>Transformation and routing of change events to the new Oracle database</li>
+  <li>Data produced by <strong>stored procedures and packages</strong> (captured as resulting DML &mdash; see Section 6)</li>
+  <li>Bidirectional sync for domains in Phase 2 handover period</li>
+  <li>Initial bulk load (snapshot) for all in-scope tables</li>
+</ul>
+
+<h2>2.2 Out of Scope</h2>
+<ul>
+  <li>Replication of Oracle stored procedure or package <strong>source code</strong> &mdash; procedures are re-implemented as application-layer services</li>
+  <li>Replication of Oracle <strong>sequences</strong> &mdash; the new system uses its own identity strategy</li>
+  <li><strong>Temporary tables</strong>, materialized view logs, and pure read-model tables (flagged in the Table Registry)</li>
+  <li>Real-time DDL propagation &mdash; schema changes are governed by a change-management process (Section 9)</li>
+</ul>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>3. Architectural Principles</h1>
+
+<table>
+  <thead>
+    <tr><th>Principle</th><th>Rationale</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Legacy DB is not modified</strong></td>
+      <td>No triggers, no additional columns, no application changes on the legacy side. LogMiner reads redo logs out-of-band.</td>
+    </tr>
+    <tr>
+      <td><strong>LogMiner-only (no XStream)</strong></td>
+      <td>Does not require the Oracle XStream add-on license. Evaluate XStream for financial domains if license is available.</td>
+    </tr>
+    <tr>
+      <td><strong>Domain-partitioned connectors</strong></td>
+      <td>One Debezium connector per functional domain, not one global connector. Isolates failures and enables independent scaling.</td>
+    </tr>
+    <tr>
+      <td><strong>Schema Registry is the contract</strong></td>
+      <td>All topic schemas are versioned in Confluent Schema Registry. Consumers never rely on raw Oracle column definitions.</td>
+    </tr>
+    <tr>
+      <td><strong>Dead-letter queues everywhere</strong></td>
+      <td>Every pipeline stage has a DLQ. No event is silently dropped.</td>
+    </tr>
+    <tr>
+      <td><strong>Idempotent sinks</strong></td>
+      <td>New DB applies changes using MERGE (upsert) keyed on primary key + SCN guard. Safe to replay any event.</td>
+    </tr>
+    <tr>
+      <td><strong>Observability first</strong></td>
+      <td>Every component emits metrics to Grafana before go-live. No domain is promoted without a working dashboard.</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>4. Oracle Version Compatibility</h1>
+
+<table>
+  <thead>
+    <tr><th>Attribute</th><th>Legacy DB (Source)</th><th>New DB (Target)</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Oracle version</strong></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">12c</ac:parameter></ac:structured-macro> (12.1 or 12.2 &mdash; confirm with DBA)</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Green</ac:parameter><ac:parameter ac:name="title">19c LTS</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr><td><strong>Multitenant</strong></td><td>Likely non-CDB &mdash; verify (see §4.1)</td><td>CDB + PDB recommended</td></tr>
+    <tr><td><strong>JDBC driver</strong></td><td><code>ojdbc8.jar</code> from Oracle 19c client (backward-compatible)</td><td><code>ojdbc8.jar</code> from Oracle 19c client</td></tr>
+    <tr><td><strong>Debezium support</strong></td><td>Full from Debezium 2.3+ (12.1 minimum)</td><td>N/A &mdash; 19c is the sink target</td></tr>
+    <tr><td><strong>LogMiner strategy</strong></td><td><code>redo_log_catalog</code> (see §4.2)</td><td>N/A</td></tr>
+    <tr><td><strong>Non-CDB status</strong></td><td>Fully supported</td><td>Deprecated &mdash; use PDB</td></tr>
+  </tbody>
+</table>
+
+<h2>4.1 CDB vs Non-CDB on Oracle 12c</h2>
+
+<ac:structured-macro ac:name="warning">
+  <ac:parameter ac:name="title">Most critical configuration decision for the connector</ac:parameter>
+  <ac:rich-text-body>
+    <p>Oracle 12c introduced the CDB/PDB multitenant architecture but made it optional. Most legacy 12c databases were deployed as traditional <strong>non-CDB</strong> instances. The two topologies require entirely different connector configurations and user privileges.</p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<p>Verify which topology the legacy DB uses:</p>
+
+<ac:structured-macro ac:name="code">
+  <ac:parameter ac:name="language">sql</ac:parameter>
+  <ac:parameter ac:name="theme">Confluence</ac:parameter>
+  <ac:plain-text-body><![CDATA[-- Run as SYSDBA on the legacy 12c instance
+SELECT CDB FROM V$DATABASE;
+-- YES → Multitenant (CDB)  |  NO → Traditional non-CDB (most common for legacy)]]></ac:plain-text-body>
+</ac:structured-macro>
+
+<table>
+  <thead>
+    <tr><th></th><th>Non-CDB (most common for legacy 12c)</th><th>CDB (12c Multitenant)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>database.pdb.name</code></td><td><strong>Not set</strong></td><td>Set to PDB name</td></tr>
+    <tr><td>LogMiner user prefix</td><td><code>dbzuser</code> (no <code>c##</code>)</td><td><code>c##dbzuser</code></td></tr>
+    <tr><td><code>CONTAINER = ALL</code> grants</td><td>Not required</td><td>Required</td></tr>
+    <tr><td><code>table.include.list</code> format</td><td><code>SCHEMA.TABLE</code></td><td><code>PDB_NAME.SCHEMA.TABLE</code></td></tr>
+    <tr><td>Setup script</td><td><code>oracle/01_cdc_setup_12c_noncdb.sql</code></td><td><code>oracle/01_cdc_setup.sql</code></td></tr>
+  </tbody>
+</table>
+
+<h2>4.2 LogMiner Strategy on Oracle 12c</h2>
+
+<table>
+  <thead>
+    <tr><th>Strategy</th><th>Recommendation</th><th>Reason</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>online_catalog</code></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">AVOID on 12c</ac:parameter></ac:structured-macro></td>
+      <td>Reads current in-memory dictionary; unreliable for DDL tracking on 12.1; can return wrong column metadata after schema changes</td>
+    </tr>
+    <tr>
+      <td><code>redo_log_catalog</code></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Green</ac:parameter><ac:parameter ac:name="title">USE THIS</ac:parameter></ac:structured-macro></td>
+      <td>Mines the data dictionary embedded in the redo log; correct for high-table-count environments and schema evolution; mandatory for this project</td>
+    </tr>
+  </tbody>
+</table>
+
+<ac:structured-macro ac:name="info">
+  <ac:rich-text-body>
+    <p>Every domain connector config must include: <code>&quot;log.mining.strategy&quot;: &quot;redo_log_catalog&quot;</code></p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<h2>4.3 Known Oracle 12c Limitations</h2>
+
+<table>
+  <thead>
+    <tr><th>Feature</th><th>12c Status</th><th>Mitigation</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>XMLTYPE columns</strong></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">NOT SUPPORTED</ac:parameter></ac:structured-macro></td>
+      <td>Mark tables in Table Registry as <code>XMLTYPE_EXCLUDED</code>; replicate via application API or file export</td>
+    </tr>
+    <tr>
+      <td><strong>LOB columns</strong> (CLOB, BLOB, NCLOB)</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">RISK ON 12.1</ac:parameter></ac:structured-macro></td>
+      <td>Requires <code>lob.enabled=true</code> + full supplemental logging; known reliability issues on 12.1 — thorough staging validation per LOB table required</td>
+    </tr>
+    <tr>
+      <td><strong>User-Defined Types (UDTs)</strong></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">NOT SUPPORTED</ac:parameter></ac:structured-macro></td>
+      <td>Re-implement as flat relational structures in the new 19c schema</td>
+    </tr>
+    <tr>
+      <td><strong>INTERVAL data types</strong></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">STRING ONLY</ac:parameter></ac:structured-macro></td>
+      <td>Captured as string literal; add type-coercion SMT in Transformation layer before 19c sink</td>
+    </tr>
+    <tr>
+      <td><strong>Invisible columns</strong></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">NOT CAPTURED</ac:parameter></ac:structured-macro></td>
+      <td>Document in Table Registry; explicitly re-add to 19c schema if required</td>
+    </tr>
+    <tr>
+      <td><strong><code>LOGMINING</code> privilege</strong></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">12.2+ ONLY</ac:parameter></ac:structured-macro></td>
+      <td>On 12.1: use <code>EXECUTE ON SYS.DBMS_LOGMNR</code> + <code>SELECT ANY DICTIONARY</code> instead</td>
+    </tr>
+    <tr>
+      <td><strong>LogMiner performance</strong></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">SLOWER THAN 19c</ac:parameter></ac:structured-macro></td>
+      <td>Use <code>redo_log_catalog</code>; tune <code>log.mining.batch.size.max</code>; retain archive logs &ge; 72 h</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>4.4 Oracle 19c Advantages for the New Database</h2>
+
+<table>
+  <thead>
+    <tr><th>Feature</th><th>Benefit</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Automatic Indexing</strong></td><td>Oracle auto-creates/drops indexes based on actual query workload &mdash; reduces DBA overhead on the new schema as access patterns emerge post-migration</td></tr>
+    <tr><td><strong>Real Application Testing</strong></td><td>Replay captured 12c production workloads against 19c to validate schema equivalence before cutover</td></tr>
+    <tr><td><strong>JSON constraints</strong></td><td><code>IS JSON</code> check constraint on VARCHAR2(32767) &mdash; natural fit for event-sourced view tables</td></tr>
+    <tr><td><strong>Approximate Query Processing</strong></td><td><code>APPROX_COUNT_DISTINCT</code> accelerates reconciliation queries on large tables</td></tr>
+    <tr><td><strong>PDB isolation</strong></td><td>Each application domain can be isolated in its own PDB, simplifying future multi-tenancy and upgrades</td></tr>
+  </tbody>
+</table>
+
+<h2>4.5 JDBC Driver Configuration</h2>
+
+<ac:structured-macro ac:name="info">
+  <ac:parameter ac:name="title">Use the Oracle 19c JDBC driver for both databases</ac:parameter>
+  <ac:rich-text-body>
+    <p>Oracle JDBC drivers are backward-compatible with older server versions. Use <strong>one driver version</strong> for both connections to simplify the deployment.</p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<ac:structured-macro ac:name="code">
+  <ac:parameter ac:name="language">text</ac:parameter>
+  <ac:parameter ac:name="theme">Confluence</ac:parameter>
+  <ac:plain-text-body><![CDATA[Kafka Connect (Debezium source) → ojdbc8.jar (19c client) → Oracle 12c  ← backward-compatible ✓
+Kafka Connect (JDBC Sink)       → ojdbc8.jar (19c client) → Oracle 19c  ← same version ✓
+
+JDK 8:   ojdbc8.jar   (minimum)
+JDK 11+: ojdbc11.jar  (recommended — Kafka Connect runs well on JDK 17)
+
+Download: Oracle Technology Network → Database 19c JDBC drivers
+Place at:  kafka-connect/ojdbc8.jar  (Dockerfile copies it automatically)]]></ac:plain-text-body>
+  </ac:structured-macro>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>5. High-Level Component Architecture</h1>
+
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Click to view full architecture diagram</ac:parameter>
+  <ac:rich-text-body>
+    <ac:structured-macro ac:name="code">
+      <ac:parameter ac:name="language">text</ac:parameter>
+      <ac:parameter ac:name="theme">Confluence</ac:parameter>
+      <ac:plain-text-body><![CDATA[
+╔══════════════════════════════════════════════════════════════════════════╗
+║  LEGACY ORACLE DB  (production — read-only from pipeline perspective)   ║
+║                                                                          ║
+║  ┌──────────┐ ┌──────────┐ ┌──────────┐       ┌──────────────────────┐ ║
+║  │ DOMAIN A │ │ DOMAIN B │ │ DOMAIN C │  ...  │   ~100 schemas       │ ║
+║  │ (INSURED)│ │(EMPLOYERS│ │(PENSIONS)│       │   ~3 000 tables      │ ║
+║  └──────────┘ └──────────┘ └──────────┘       │   + Proc / Packages  │ ║
+║       │ Redo Logs (Oracle LogMiner)            └──────────────────────┘ ║
+╚═══════╪══════════════════════════════════════════════════════════════════╝
+        │
+        ▼
+╔═══════════════════════════════════════════════════════════════════════════╗
+║  CDC CAPTURE LAYER  (Kafka Connect cluster — 3+ nodes)                   ║
+║                                                                           ║
+║  ┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌─────────────┐  ║
+║  │ Connector     │ │ Connector     │ │ Connector     │ │ Connector   │  ║
+║  │ DOMAIN-A      │ │ DOMAIN-B      │ │ DOMAIN-C      │ │ REF-DATA    │  ║
+║  │ (~300 tables) │ │ (~300 tables) │ │ (~300 tables) │ │ (~200 tbls) │  ║
+║  └───────────────┘ └───────────────┘ └───────────────┘ └─────────────┘  ║
+║         ... 10–15 connectors total, grouped by functional domain         ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+        │  Avro + Schema Registry
+        ▼
+╔═══════════════════════════════════════════════════════════════════════════╗
+║  KAFKA CLUSTER  (3+ brokers, replication factor 3)                       ║
+║                                                                           ║
+║  Topic pattern :  legacy.{SCHEMA}.{TABLE}                                ║
+║  DLQ pattern   :  dlq.legacy.{SCHEMA}.{TABLE}                            ║
+║  Audit topic   :  audit.cdc.events  (all schemas, sampled)               ║
+║                                                                           ║
+║  Retention: 7 days (transactional)  /  30 days (reference data)         ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+        │
+        ▼
+╔═══════════════════════════════════════════════════════════════════════════╗
+║  TRANSFORMATION LAYER  (Kafka Streams / ksqlDB)                          ║
+║                                                                           ║
+║  ┌─────────────────────┐  ┌─────────────────────┐  ┌──────────────────┐ ║
+║  │ PII Masking         │  │ Schema Mapping       │  │ Conflict         │ ║
+║  │ (GDPR compliance)   │  │ (field renames,      │  │ Detector         │ ║
+║  │                     │  │  type coercions)     │  │ (Phase 2 only)   │ ║
+║  └─────────────────────┘  └─────────────────────┘  └──────────────────┘ ║
+║  ┌─────────────────────┐  ┌─────────────────────┐                        ║
+║  │ Domain Router       │  │ Enrichment           │                        ║
+║  │ (splits by target   │  │ (lookup joins for    │                        ║
+║  │  schema)            │  │  denormalised views) │                        ║
+║  └─────────────────────┘  └─────────────────────┘                        ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+        │
+        ▼
+╔═══════════════════════════════════════════════════════════════════════════╗
+║  SINK LAYER  (Kafka Connect — JDBC Sink Connectors)                      ║
+║  MERGE (upsert) on PK + SCN guard                                        ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+        │
+        ▼
+╔══════════════════════════════════════════════════════════════════════════╗
+║  NEW ORACLE DB  (new application — target)                               ║
+║  Mirrored schemas  +  new-model schemas  +  sync metadata schema        ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+ Cross-cutting: Schema Registry · Prometheus/Grafana · ELK/Loki · PagerDuty
+]]></ac:plain-text-body>
+    </ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>6. Connector Topology</h1>
+
+<ac:structured-macro ac:name="warning">
+  <ac:parameter ac:name="title">Why not one connector for all 3 000 tables?</ac:parameter>
+  <ac:rich-text-body>
+    <p>A single Debezium connector mining 3 000 tables creates one LogMiner session spanning all schemas. This causes two problems: (a) the LogMiner session becomes very wide and slow, and (b) a failure or lag spike in one domain stalls <em>all</em> others. Domain-partitioned connectors solve both issues.</p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<h2>6.1 Domain Grouping</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Connector</th>
+      <th>Schemas (examples)</th>
+      <th>~Tables</th>
+      <th>Priority</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>cdc-insured-persons</code></td>
+      <td>INSURED, PERSONS, DEMOGRAPHICS</td>
+      <td>~300</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">CRITICAL</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td><code>cdc-employers</code></td>
+      <td>EMPLOYERS, EMPLOYER_CONTRIB</td>
+      <td>~280</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">CRITICAL</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td><code>cdc-contributions</code></td>
+      <td>CONTRIBUTIONS, INSTALLMENTS, DEBTS</td>
+      <td>~350</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">CRITICAL</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td><code>cdc-pensions</code></td>
+      <td>PENSIONS, PENSION_CALC, BENEFITS</td>
+      <td>~320</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">CRITICAL</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td><code>cdc-health</code></td>
+      <td>HEALTH_INSUR, MEDICAL_CLAIMS</td>
+      <td>~260</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">HIGH</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td><code>cdc-accidents</code></td>
+      <td>WORK_ACCIDENTS, OCCUPATIONAL</td>
+      <td>~180</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">HIGH</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td><code>cdc-reference-data</code></td>
+      <td>CODES, LOOKUPS, PARAMETERS, TYPES</td>
+      <td>~200</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Blue</ac:parameter><ac:parameter ac:name="title">MEDIUM</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td><code>cdc-audit-legacy</code></td>
+      <td>AUDIT_*, LOG_*</td>
+      <td>~150</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Grey</ac:parameter><ac:parameter ac:name="title">LOW</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td><code>cdc-archive</code></td>
+      <td>HIST_*, ARCHIVE_*</td>
+      <td>~300</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Grey</ac:parameter><ac:parameter ac:name="title">LOW</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td><em>(additional domains)</em></td>
+      <td>&hellip;</td>
+      <td>~460</td>
+      <td>&mdash;</td>
+    </tr>
+  </tbody>
+</table>
+
+<ac:structured-macro ac:name="info">
+  <ac:rich-text-body>
+    <p>Each connector gets its own Kafka Connect worker task and its own <code>schema.history.internal</code> topic. This means a schema history reset on one domain does not affect others.</p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<h2>6.2 Connector Configuration Template</h2>
+
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Per-domain connector config parameters</ac:parameter>
+  <ac:rich-text-body>
+    <ac:structured-macro ac:name="code">
+      <ac:parameter ac:name="language">json</ac:parameter>
+      <ac:parameter ac:name="theme">Confluence</ac:parameter>
+      <ac:parameter ac:name="linenumbers">true</ac:parameter>
+      <ac:plain-text-body><![CDATA[{
+  "connector.class": "io.debezium.connector.oracle.OracleConnector",
+  "database.connection.adapter": "logminer",
+  "log.mining.strategy": "online_catalog",
+  "log.mining.batch.size.max": "10000",
+  "log.mining.sleep.time.max.ms": "3000",
+  "snapshot.mode": "initial",
+  "snapshot.isolation.mode": "read_committed",
+  "snapshot.fetch.size": "2000",
+  "max.batch.size": "2048",
+  "max.queue.size": "16384",
+  "heartbeat.interval.ms": "10000",
+  "schema.history.internal.store.only.captured.tables.ddl": "true",
+  "decimal.handling.mode": "double",
+  "time.precision.mode": "connect",
+  "tombstones.on.delete": "true"
+}]]></ac:plain-text-body>
+    </ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<h2>6.3 Table Classification (Table Registry)</h2>
+
+<p>Not all 3 000 tables need replication. The <strong>Table Registry</strong> (maintained in Confluence) classifies every table:</p>
+
+<table>
+  <thead>
+    <tr><th>Class</th><th>Action</th><th>Examples</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>TRANSACTIONAL</code></td><td>Capture + sync</td><td>Core business tables</td></tr>
+    <tr><td><code>REFERENCE</code></td><td>Capture + sync (low frequency)</td><td>Code tables, parameter tables</td></tr>
+    <tr><td><code>SESSION</code></td><td><strong>Exclude</strong></td><td><code>SESSION_*</code>, <code>TEMP_*</code>, <code>WRK_*</code></td></tr>
+    <tr><td><code>LEGACY_ONLY</code></td><td><strong>Exclude</strong></td><td>Tables deprecated in the new model</td></tr>
+    <tr><td><code>MATERIALIZED_VIEW</code></td><td><strong>Exclude</strong></td><td><code>MV_*</code> &mdash; rebuilt from events in new DB</td></tr>
+    <tr><td><code>QUEUE_TABLE</code></td><td><strong>Exclude</strong></td><td>Oracle AQ internal tables</td></tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>7. Handling Stored Procedures and Packages</h1>
+
+<ac:structured-macro ac:name="info">
+  <ac:parameter ac:name="title">What Debezium captures</ac:parameter>
+  <ac:rich-text-body>
+    <p>Debezium does <strong>not</strong> replicate stored procedure execution &mdash; it captures the <strong>resulting DML</strong> (INSERT / UPDATE / DELETE rows) written to the redo log. When a legacy procedure such as <code>PKG_CONTRIBUTIONS.CALC_MONTHLY_DEBT(p_insured_id)</code> writes 12 rows to <code>CONTRIBUTIONS.MONTHLY_DEBT</code>, Debezium captures all 12 row-level change events. The new database receives the data correctly. <strong>This covers the majority of cases.</strong></p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<h2>7.1 Scenarios NOT Automatically Captured</h2>
+
+<table>
+  <thead>
+    <tr><th>Scenario</th><th>Problem</th><th>Mitigation</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Procedures that only call other procedures with no DML</td>
+      <td>No events emitted</td>
+      <td>Identify and instrument with explicit DML or wrapper</td>
+    </tr>
+    <tr>
+      <td>Procedures writing to <em>excluded</em> tables (SESSION, TEMP)</td>
+      <td>Data not replicated</td>
+      <td>Trace downstream DML; ensure final write to permanent tables is captured</td>
+    </tr>
+    <tr>
+      <td>DBMS_OUTPUT / in-memory calculations with no DML</td>
+      <td>Nothing to capture</td>
+      <td>Re-implement as application service</td>
+    </tr>
+    <tr>
+      <td><code>PRAGMA AUTONOMOUS_TRANSACTION</code></td>
+      <td>May appear out of order</td>
+      <td>SCN-based ordering at the sink resolves this</td>
+    </tr>
+    <tr>
+      <td>DDL executed from PL/SQL (<code>ALTER TABLE</code> inside a procedure)</td>
+      <td>Schema history may lag</td>
+      <td>Schema change management process; connector restart policy</td>
+    </tr>
+    <tr>
+      <td><code>DBMS_SCHEDULER</code> / DB-level job results</td>
+      <td>Captured only if the job produces DML</td>
+      <td>Monitor job completion via separate alerting</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>7.2 Procedure Audit (Phase 0 Deliverable)</h2>
+
+<ac:structured-macro ac:name="warning">
+  <ac:parameter ac:name="title">Revised effort: 4–6 person-weeks (>1 000 procedures confirmed)</ac:parameter>
+  <ac:rich-text-body>
+    <p>The original 2 person-week estimate assumed 200–500 procedures. With &gt;1 000 confirmed, automated tooling is required before manual classification can begin.</p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<ac:structured-macro ac:name="code">
+  <ac:parameter ac:name="language">sql</ac:parameter>
+  <ac:parameter ac:name="theme">Confluence</ac:parameter>
+  <ac:plain-text-body><![CDATA[-- Step 1: Enable PL/Scope to capture call graphs and DML references
+ALTER SESSION SET PLSCOPE_SETTINGS = 'IDENTIFIERS:ALL';
+-- (Re-compile each package/procedure after setting this)
+
+-- Step 2: Extract DML footprint per procedure
+SELECT owner, name, type, line, text
+FROM   all_source
+WHERE  UPPER(text) LIKE '%INSERT%'
+    OR UPPER(text) LIKE '%UPDATE%'
+    OR UPPER(text) LIKE '%DELETE%'
+    OR UPPER(text) LIKE '%MERGE%'
+ORDER  BY owner, name, line;
+
+-- Step 3: Build dependency graph
+SELECT name, referenced_owner, referenced_name, referenced_type
+FROM   all_dependencies
+WHERE  type IN ('PACKAGE', 'PACKAGE BODY', 'PROCEDURE', 'FUNCTION')
+ORDER  BY name;]]></ac:plain-text-body>
+  </ac:structured-macro>
+
+<ac:structured-macro ac:name="code">
+  <ac:parameter ac:name="language">text</ac:parameter>
+  <ac:parameter ac:name="theme">Confluence</ac:parameter>
+  <ac:plain-text-body><![CDATA[Classification workflow per procedure (after automated DML extraction):
+  1. Classify: does it produce DML on in-scope TRANSACTIONAL tables?
+  2. If yes  → verify events flow correctly through CDC pipeline (test in staging)
+  3. If no   → flag for re-implementation in the new application layer
+  4. Document in Confluence: eEFKA / Migration / Procedure Inventory
+
+Effort: 4–6 person-weeks | Tooling: PL/Scope + ALL_DEPENDENCIES queries
+Gate:   All procedures classified before any domain goes live in production]]></ac:plain-text-body>
+  </ac:structured-macro>
+
+<h2>7.3 Procedures Requiring Re-Implementation</h2>
+
+<p>Any business logic that is not expressible as observable row changes must be migrated to the new application layer:</p>
+<ul>
+  <li><strong>Calculation engines</strong> (pension amounts, contribution rates) &rarr; Java/Python services</li>
+  <li><strong>Validation procedures</strong> &rarr; application-layer validators</li>
+  <li><strong>Notification procedures</strong> (DBMS_MAIL, UTL_HTTP) &rarr; new messaging services</li>
+  <li><strong>Scheduled batch recalculations</strong> &rarr; new batch jobs on the new platform</li>
+</ul>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>8. Initial Bulk Load (Snapshot)</h1>
+
+<h2>8.1 Three-Phase Snapshot Strategy</h2>
+
+<table>
+  <thead>
+    <tr><th>Phase</th><th>Scope</th><th>Est. Rows</th><th>Est. Duration</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>A &mdash; Reference data first</strong></td>
+      <td>Codes, lookups, parameters</td>
+      <td>~5 M</td>
+      <td>&lt; 1 hour</td>
+    </tr>
+    <tr>
+      <td><strong>B &mdash; Core transactional domains</strong></td>
+      <td>All critical + high-priority connectors (parallel)</td>
+      <td>~500 M &ndash; 2 B</td>
+      <td>8&ndash;24 hours</td>
+    </tr>
+    <tr>
+      <td><strong>C &mdash; Archive / history tables</strong></td>
+      <td>Low-priority connectors</td>
+      <td>Variable</td>
+      <td>Can lag by 24 h</td>
+    </tr>
+  </tbody>
+</table>
+
+<ac:structured-macro ac:name="note">
+  <ac:parameter ac:name="title">Snapshot Parallelism Rules</ac:parameter>
+  <ac:rich-text-body>
+    <ul>
+      <li>Run critical-domain snapshots during an agreed <strong>off-peak window</strong> (e.g., 22:00&ndash;06:00)</li>
+      <li>Stagger connector start times by 15&ndash;30 minutes to avoid overwhelming Oracle I/O</li>
+      <li>Cap <code>snapshot.fetch.size</code> at 2 000 rows per batch</li>
+    </ul>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<h2>8.2 Post-Snapshot Reconciliation</h2>
+
+<ac:structured-macro ac:name="code">
+  <ac:parameter ac:name="language">sql</ac:parameter>
+  <ac:parameter ac:name="theme">Confluence</ac:parameter>
+  <ac:plain-text-body><![CDATA[-- Run on both databases for each table
+SELECT COUNT(*) FROM {schema}.{table};
+-- Alert if delta > 0.01% (reference data) or > 0 (financial data)]]></ac:plain-text-body>
+  </ac:structured-macro>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>9. Bidirectional Sync (Phase 2 &mdash; Domain Handover)</h1>
+
+<ac:structured-macro ac:name="warning">
+  <ac:parameter ac:name="title">Financial tables are NEVER written bidirectionally</ac:parameter>
+  <ac:rich-text-body>
+    <p>Contribution, debt, and pension payment tables must have <strong>exactly one authoritative writer</strong> at any point in time. A conflict in these tables is a regulatory problem, not just a data integrity problem. A single writer is enforced until full cutover for all financial domains.</p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<h2>9.1 Conflict Sources</h2>
+
+<table>
+  <thead>
+    <tr><th>Scenario</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Concurrent updates</td><td>Legacy and new app update the same row within the same second</td></tr>
+    <tr><td>Cascading updates</td><td>A procedure on legacy triggers a cascade that arrives out of order</td></tr>
+    <tr><td>Delete vs update</td><td>Legacy deletes a row; new app updates the same row before the delete arrives</td></tr>
+    <tr><td>Schema drift</td><td>A DDL change on one side is not yet applied to the other</td></tr>
+  </tbody>
+</table>
+
+<h2>9.2 Conflict Resolution Rules</h2>
+
+<ac:structured-macro ac:name="code">
+  <ac:parameter ac:name="language">sql</ac:parameter>
+  <ac:parameter ac:name="theme">Confluence</ac:parameter>
+  <ac:parameter ac:name="linenumbers">true</ac:parameter>
+  <ac:plain-text-body><![CDATA[-- Rule 1: Last-Write-Wins by SCN
+-- Each event carries a System Change Number. Higher SCN wins.
+MERGE INTO target t USING source s ON (t.pk = s.pk)
+WHEN MATCHED AND s.source_scn > t.last_sync_scn THEN
+  UPDATE SET t.col1 = s.col1, ..., t.last_sync_scn = s.source_scn
+WHEN NOT MATCHED THEN
+  INSERT (pk, col1, ..., last_sync_scn) VALUES (s.pk, s.col1, ..., s.source_scn);
+
+-- Rule 2: Domain Authority
+-- Only the authoritative system writes to the canonical record.
+-- The other system writes to a shadow/staging table.
+
+-- Rule 3: Conflict Log
+-- Any event rejected by Rule 1 is written to:
+INSERT INTO SYNC_METADATA.CONFLICT_LOG
+  (table_name, pk_value, winning_scn, losing_scn, winning_source, ts)
+VALUES (:table, :pk, :win_scn, :lose_scn, :source, SYSTIMESTAMP);]]></ac:plain-text-body>
+  </ac:structured-macro>
+
+<h2>9.3 Reverse CDC (New &rarr; Legacy)</h2>
+
+<p>When the new application becomes authoritative for a domain, a <strong>reverse Debezium connector</strong> captures changes from the new DB and syncs them back to the legacy DB, supporting legacy integrations that cannot be migrated immediately. The topology is symmetric &mdash; the same Debezium + Kafka infrastructure handles both directions.</p>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>10. Schema Evolution Governance</h1>
+
+<ac:structured-macro ac:name="info">
+  <ac:parameter ac:name="title">Schema Registry Compatibility Mode: BACKWARD_TRANSITIVE</ac:parameter>
+  <ac:rich-text-body>
+    <p>Consumers can always read messages written with any previous schema version. New nullable columns with defaults are safe to add without coordination. Column renames and drops require the compatibility break process below.</p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<h2>10.1 DDL Change Process</h2>
+
+<ac:structured-macro ac:name="code">
+  <ac:parameter ac:name="language">text</ac:parameter>
+  <ac:parameter ac:name="theme">Confluence</ac:parameter>
+  <ac:plain-text-body><![CDATA[1. Change request filed in Jira (project: EEEFKA-MIGRATION)
+2. DBA applies DDL to legacy DB
+3. Debezium detects DDL via LogMiner → updates schema.history topic
+4. Migration team reviews the schema diff in Schema Registry UI
+5a. If BACKWARD compatible  → auto-deployed to new DB by Liquibase job
+5b. If BREAKING change      → manual migration script reviewed + approved
+                              Connector may need restart with schema.history reset
+6. Reconciliation job runs after DDL propagation to confirm consistency]]></ac:plain-text-body>
+  </ac:structured-macro>
+
+<h2>10.2 Schema Registry Topic Layout</h2>
+
+<ac:structured-macro ac:name="code">
+  <ac:parameter ac:name="language">text</ac:parameter>
+  <ac:parameter ac:name="theme">Confluence</ac:parameter>
+  <ac:plain-text-body><![CDATA[_legacy_schema_history.domain-a     ← per-connector DDL history (isolated)
+_legacy_schema_history.domain-b
+...
+_schema_registry                    ← Confluent Schema Registry (shared)]]></ac:plain-text-body>
+  </ac:structured-macro>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>11. Data Quality and Reconciliation</h1>
+
+<h2>11.1 Continuous Reconciliation (every 15 minutes)</h2>
+
+<ac:structured-macro ac:name="code">
+  <ac:parameter ac:name="language">text</ac:parameter>
+  <ac:parameter ac:name="theme">Confluence</ac:parameter>
+  <ac:plain-text-body><![CDATA[For each of 50 randomly sampled tables per cycle:
+  1. Pick a random PK range covering ~1 000 rows
+  2. Hash the rows on both databases (MD5 of serialised row)
+  3. If hashes differ  → log to SYNC_METADATA.RECONCILIATION_ISSUES
+  4. If divergence > 0.1%  → PagerDuty P2 alert
+  5. If divergence > 1%    → PagerDuty P1 alert + auto-pause connector]]></ac:plain-text-body>
+  </ac:structured-macro>
+
+<h2>11.2 Full Nightly Reconciliation (financial tables)</h2>
+
+<p>For financial tables (contributions, debts, pensions) a full count + checksum reconciliation runs nightly:</p>
+<ul>
+  <li>Compares row counts and <code>SUM</code> of key financial columns</li>
+  <li>Results written to <code>SYNC_METADATA.NIGHTLY_RECONCILIATION</code></li>
+  <li>Any discrepancy &gt; 0 on financial tables triggers immediate <strong>P1</strong></li>
+</ul>
+
+<h2>11.3 Dead-Letter Queue Processing</h2>
+
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">DLQ processing details</ac:parameter>
+  <ac:rich-text-body>
+    <p>DLQ topic pattern: <code>dlq.legacy.{SCHEMA}.{TABLE}</code></p>
+    <p>Events land in DLQ when:</p>
+    <ul>
+      <li>Sink connector cannot apply the event (constraint violation, type mismatch)</li>
+      <li>Transformation fails (null PK, corrupt Avro payload)</li>
+    </ul>
+    <p>DLQ processor (daily batch job):</p>
+    <ol>
+      <li>Parse the failed event and root cause</li>
+      <li>Categorise: <code>schema_mismatch</code> | <code>constraint_violation</code> | <code>data_error</code></li>
+      <li>Apply fix (re-derive, skip with justification, or manual correction)</li>
+      <li>Re-publish to original topic with corrected payload</li>
+    </ol>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>12. Security and Compliance (GDPR / Hellenic DPA)</h1>
+
+<ac:structured-macro ac:name="warning">
+  <ac:parameter ac:name="title">eEFKA handles sensitive citizen data subject to GDPR and HDPA requirements</ac:parameter>
+  <ac:rich-text-body>
+    <p>All tables containing AMKA, AFM, IBAN, or medical data must be identified in the Table Registry and have the PII masking SMT applied <strong>before</strong> events enter any Kafka topic.</p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<h2>12.1 PII Masking in Transit</h2>
+
+<table>
+  <thead>
+    <tr><th>Field Type</th><th>Masking Strategy</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>AMKA (social security number)</td><td>SHA-256 HMAC hash with rotating salt; reversible only by authorised services</td></tr>
+    <tr><td>Full name</td><td>Kept in topic (required for sync); topic access restricted by ACL</td></tr>
+    <tr><td>Tax number (AFM)</td><td>SHA-256 HMAC hash with rotating salt</td></tr>
+    <tr><td>Bank account (IBAN)</td><td>Last 4 digits only in Kafka; full value only in the DB-to-DB sync path</td></tr>
+    <tr><td>Medical data</td><td>Full field encryption (AES-256); decrypted only at the sink by authorised service</td></tr>
+  </tbody>
+</table>
+
+<h2>12.2 Topic Access Control (Kafka ACLs)</h2>
+
+<table>
+  <thead>
+    <tr><th>Principal</th><th>Permission</th><th>Topic Pattern</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>CDC capture connectors</td><td>WRITE</td><td><code>legacy.*</code></td></tr>
+    <tr><td>Transformation services</td><td>READ / WRITE</td><td><code>legacy.*</code> / <code>transformed.*</code></td></tr>
+    <tr><td>Sink connectors</td><td>READ</td><td><code>transformed.*</code></td></tr>
+    <tr><td>Audit service</td><td>READ</td><td><code>*</code></td></tr>
+    <tr><td>External systems</td><td><strong>DENY</strong></td><td>Raw CDC topics</td></tr>
+  </tbody>
+</table>
+
+<h2>12.3 Audit Trail</h2>
+
+<p>Every event that flows through the pipeline is recorded in a tamper-evident audit log retained for <strong>7 years</strong> (statutory requirement for social security data).</p>
+
+<ac:structured-macro ac:name="code">
+  <ac:parameter ac:name="language">json</ac:parameter>
+  <ac:parameter ac:name="theme">Confluence</ac:parameter>
+  <ac:plain-text-body><![CDATA[// audit.cdc.events topic — one record per CDC event
+{
+  "event_id":       "uuid",
+  "source_table":   "CONTRIBUTIONS.MONTHLY_DEBT",
+  "operation":      "u",
+  "pk_value":       "12345",
+  "scn":            9876543210,
+  "pipeline_ts":    "2026-06-05T10:23:01Z",
+  "connector_id":   "cdc-contributions",
+  "schema_version": 7
+}]]></ac:plain-text-body>
+  </ac:structured-macro>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>13. Infrastructure Sizing</h1>
+
+<table>
+  <thead>
+    <tr><th>Component</th><th>Minimum</th><th>Recommended (3 000 tables)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Kafka brokers</td><td>3 &times; 8 vCPU / 32 GB</td><td>5 &times; 16 vCPU / 64 GB</td></tr>
+    <tr><td>Kafka Connect workers</td><td>3 &times; 8 vCPU / 16 GB</td><td>5 &times; 16 vCPU / 32 GB</td></tr>
+    <tr><td>Schema Registry</td><td>2 &times; 4 vCPU / 8 GB</td><td>3 &times; 4 vCPU / 8 GB (HA)</td></tr>
+    <tr><td>ksqlDB / Kafka Streams</td><td>3 &times; 8 vCPU / 32 GB</td><td>5 &times; 16 vCPU / 64 GB</td></tr>
+    <tr><td>Monitoring (Prometheus + Grafana)</td><td>1 &times; 4 vCPU / 16 GB</td><td>2 &times; nodes (HA)</td></tr>
+    <tr><td>Kafka storage per broker</td><td>2 TB SSD</td><td>4 TB SSD</td></tr>
+  </tbody>
+</table>
+
+<ac:structured-macro ac:name="note">
+  <ac:rich-text-body>
+    <p>LogMiner sessions on Oracle require adequate SGA/PGA. Coordinate with the DBA team: <code>LOG_ARCHIVE_DEST_1</code> must retain at least <strong>72 hours</strong> of redo log history to handle connector restarts and replay scenarios.</p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<ac:structured-macro ac:name="info">
+  <ac:parameter ac:name="title">Two-DC deployment (primary + DR)</ac:parameter>
+  <ac:rich-text-body>
+    <p>With a primary + DR on-premises deployment, distribute the Kafka cluster across both data centres:</p>
+    <ul>
+      <li><strong>Primary DC:</strong> 3 Kafka brokers + 3 Kafka Connect workers + Schema Registry primary</li>
+      <li><strong>DR DC:</strong> 2 Kafka brokers + 2 standby Kafka Connect workers + Schema Registry replica</li>
+      <li>Add <strong>Kafka MirrorMaker 2</strong> (1 process per DC) for cross-DC topic replication</li>
+      <li>Oracle 19c DR is handled by <strong>Oracle Data Guard</strong> &mdash; the CDC pipeline does not write directly to the DR Oracle instance</li>
+      <li>Total additional nodes for DR capability: ~4 (2 Kafka brokers + 2 MirrorMaker 2)</li>
+    </ul>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>14. Monitoring and Observability</h1>
+
+<h2>14.1 Key Metrics &amp; Alert Thresholds</h2>
+
+<table>
+  <thead>
+    <tr><th>Metric</th><th>Alert Threshold</th><th>Severity</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>debezium_connector_lag_ms</code> per connector</td>
+      <td>&gt; 10 000 ms</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">P2</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td><code>debezium_connector_lag_ms</code> per connector</td>
+      <td>&gt; 60 000 ms</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">P1</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td><code>kafka_consumer_lag</code> per sink connector</td>
+      <td>&gt; 50 000 messages</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">P2</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td>DLQ topic message rate</td>
+      <td>&gt; 0 sustained for 5 min</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">P2</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td>Reconciliation divergence</td>
+      <td>&gt; 0.1 % on any table</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">P2</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td>Connector status <code>FAILED</code></td>
+      <td>Any</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">P1</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td>Oracle LogMiner session errors (<code>ORA-310xx</code>)</td>
+      <td>Any</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">P1</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td>Schema Registry incompatible schema submitted</td>
+      <td>Any</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">P1</ac:parameter></ac:structured-macro></td>
+    </tr>
+    <tr>
+      <td>Nightly financial reconciliation divergence</td>
+      <td>&gt; 0 rows</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">P1</ac:parameter></ac:structured-macro></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>14.2 Operational Runbooks</h2>
+
+<table>
+  <thead>
+    <tr><th>Scenario</th><th>Runbook</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Connector enters FAILED state</td><td><code>runbooks/connector-recovery.md</code></td></tr>
+    <tr><td>Kafka consumer lag spike</td><td><code>runbooks/lag-remediation.md</code></td></tr>
+    <tr><td>Oracle redo log gap (archive purged before consumed)</td><td><code>runbooks/logminer-gap.md</code></td></tr>
+    <tr><td>DLQ backlog &gt; 10 000 events</td><td><code>runbooks/dlq-processing.md</code></td></tr>
+    <tr><td>Schema incompatibility detected</td><td><code>runbooks/schema-evolution.md</code></td></tr>
+    <tr><td>Nightly reconciliation failure</td><td><code>runbooks/reconciliation-failure.md</code></td></tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>15. Phased Rollout Plan</h1>
+
+<h2>Phase 0 &mdash; Foundation (Weeks 1&ndash;8)</h2>
+<ac:task-list>
+  <ac:task><ac:task-id>1</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Provision Kafka cluster across both DCs (3 brokers primary + 2 brokers DR, rack-aware) + MirrorMaker 2 (1 process per DC)</ac:task-body></ac:task>
+  <ac:task><ac:task-id>2</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Provision Kafka Connect workers (3 primary DC + 2 standby DR DC)</ac:task-body></ac:task>
+  <ac:task><ac:task-id>3</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Deploy Schema Registry (HA, 3 nodes), ksqlDB, Grafana + cross-DC monitoring</ac:task-body></ac:task>
+  <ac:task><ac:task-id>4</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Configure PL/Scope tooling and run automated procedure inventory &mdash; <strong>4&ndash;6 person-weeks</strong>, dedicated analyst (>1 000 procedures confirmed)</ac:task-body></ac:task>
+  <ac:task><ac:task-id>5</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Produce Table Registry: classify all ~3 000 tables (TRANSACTIONAL / REFERENCE / SESSION / EXCLUDED / XMLTYPE_EXCLUDED)</ac:task-body></ac:task>
+  <ac:task><ac:task-id>6</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Complete PII data map with DPO &mdash; <strong>gate criterion</strong>: no connector registered in production until masking rules confirmed for all PII tables</ac:task-body></ac:task>
+  <ac:task><ac:task-id>7</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Configure Oracle LogMiner user and supplemental logging on legacy 12c DB (CDB vs non-CDB per Section 4.1)</ac:task-body></ac:task>
+  <ac:task><ac:task-id>8</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Validate PoC (Debezium + Kafka) against a staging Oracle 12c clone</ac:task-body></ac:task>
+  <ac:task><ac:task-id>9</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Define and document DLQ processing SLA and runbooks</ac:task-body></ac:task>
+</ac:task-list>
+
+<h2>Phase 1 &mdash; Reference Data (Weeks 7&ndash;10)</h2>
+<ac:task-list>
+  <ac:task><ac:task-id>8</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Deploy <code>cdc-reference-data</code> connector</ac:task-body></ac:task>
+  <ac:task><ac:task-id>9</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Validate schema evolution process end-to-end with 2 test DDL changes</ac:task-body></ac:task>
+  <ac:task><ac:task-id>10</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Full row-count reconciliation pass on all reference tables</ac:task-body></ac:task>
+  <ac:task><ac:task-id>11</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Sign off Grafana dashboards and alert routing with operations team</ac:task-body></ac:task>
+</ac:task-list>
+
+<h2>Phase 2 &mdash; Non-Financial Domains (Weeks 11&ndash;20)</h2>
+<ac:task-list>
+  <ac:task><ac:task-id>12</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Deploy connectors: <code>cdc-insured-persons</code>, <code>cdc-employers</code>, <code>cdc-health</code>, <code>cdc-accidents</code></ac:task-body></ac:task>
+  <ac:task><ac:task-id>13</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>New application reads from new DB in <em>read-only validation mode</em></ac:task-body></ac:task>
+  <ac:task><ac:task-id>14</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Run 15-minute reconciliation for 2 weeks before enabling writes in new app</ac:task-body></ac:task>
+  <ac:task><ac:task-id>15</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>PII masking SMT validated by Data Protection Officer</ac:task-body></ac:task>
+</ac:task-list>
+
+<h2>Phase 3 &mdash; Financial Domains (Weeks 21&ndash;30)</h2>
+<ac:task-list>
+  <ac:task><ac:task-id>16</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Deploy connectors: <code>cdc-contributions</code>, <code>cdc-pensions</code></ac:task-body></ac:task>
+  <ac:task><ac:task-id>17</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Enable nightly full financial reconciliation with P1 alerting</ac:task-body></ac:task>
+  <ac:task><ac:task-id>18</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Confirm: legacy is sole writer for all financial tables (no bidirectional sync)</ac:task-body></ac:task>
+  <ac:task><ac:task-id>19</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Security review of end-to-end pipeline by InfoSec team</ac:task-body></ac:task>
+</ac:task-list>
+
+<h2>Phase 4 &mdash; Domain Handovers (Weeks 31&ndash;52)</h2>
+<ac:task-list>
+  <ac:task><ac:task-id>20</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Per-domain handover plan agreed with business owners</ac:task-body></ac:task>
+  <ac:task><ac:task-id>21</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Enable reverse CDC for each handed-over domain</ac:task-body></ac:task>
+  <ac:task><ac:task-id>22</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Conflict log reviewed daily during handover window</ac:task-body></ac:task>
+  <ac:task><ac:task-id>23</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Legacy access progressively restricted per domain post-handover</ac:task-body></ac:task>
+</ac:task-list>
+
+<h2>Phase 5 &mdash; Legacy Decommission</h2>
+<ac:task-list>
+  <ac:task><ac:task-id>24</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>All domains confirmed authoritative in new system (sign-off from business)</ac:task-body></ac:task>
+  <ac:task><ac:task-id>25</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>Legacy DB switched to read-only archive mode</ac:task-body></ac:task>
+  <ac:task><ac:task-id>26</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>CDC pipeline decommissioned or repurposed for archive-only sync</ac:task-body></ac:task>
+</ac:task-list>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>16. Risks and Mitigations</h1>
+
+<table>
+  <thead>
+    <tr><th>Risk</th><th>Likelihood</th><th>Impact</th><th>Mitigation</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>LogMiner session overwhelmed by 3 000-table scan</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">HIGH</ac:parameter></ac:structured-macro></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">HIGH</ac:parameter></ac:structured-macro></td>
+      <td>Domain-partitioned connectors; tune <code>log.mining.batch.size.max</code></td>
+    </tr>
+    <tr>
+      <td>Oracle archive log gap (redo log purged before consumed)</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">MEDIUM</ac:parameter></ac:structured-macro></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">CRITICAL</ac:parameter></ac:structured-macro></td>
+      <td>Set <code>LOG_ARCHIVE_DEST_1</code> retention &ge; 72 h; monitor connector lag continuously</td>
+    </tr>
+    <tr>
+      <td>PL/SQL procedure producing DML not captured by pipeline</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">MEDIUM</ac:parameter></ac:structured-macro></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">HIGH</ac:parameter></ac:structured-macro></td>
+      <td>Full procedure audit in Phase 0; staging validation for each domain before promotion</td>
+    </tr>
+    <tr>
+      <td>DDL breaking change disrupts connector</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">MEDIUM</ac:parameter></ac:structured-macro></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">HIGH</ac:parameter></ac:structured-macro></td>
+      <td>Schema change process (Section 9); connector restart playbook</td>
+    </tr>
+    <tr>
+      <td>New and legacy apps writing conflicting financial data</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">MEDIUM</ac:parameter></ac:structured-macro></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">CRITICAL</ac:parameter></ac:structured-macro></td>
+      <td>Financial tables: single writer enforced; conflict log reviewed daily</td>
+    </tr>
+    <tr>
+      <td>GDPR breach via unsecured Kafka topic</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Green</ac:parameter><ac:parameter ac:name="title">LOW</ac:parameter></ac:structured-macro></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">CRITICAL</ac:parameter></ac:structured-macro></td>
+      <td>Topic ACLs; PII masking SMT applied before events enter Kafka; encryption at rest</td>
+    </tr>
+    <tr>
+      <td>Snapshot duration exceeds maintenance window</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">MEDIUM</ac:parameter></ac:structured-macro></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">MEDIUM</ac:parameter></ac:structured-macro></td>
+      <td>Stagger connector starts; off-peak window; <code>snapshot.select.statement.overrides</code> to limit row ranges</td>
+    </tr>
+    <tr>
+      <td>Schema Registry as single point of failure</td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Green</ac:parameter><ac:parameter ac:name="title">LOW</ac:parameter></ac:structured-macro></td>
+      <td><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Red</ac:parameter><ac:parameter ac:name="title">HIGH</ac:parameter></ac:structured-macro></td>
+      <td>Deploy Schema Registry in HA mode (3 nodes); topic replication factor &ge; 3</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<h1>17. Open Questions</h1>
+
+<ol>
+  <li>
+    <p><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Green</ac:parameter><ac:parameter ac:name="title">RESOLVED</ac:parameter></ac:structured-macro> <strong>LogMiner vs XStream</strong><br/>
+    eEFKA does <strong>not</strong> hold an Oracle XStream license. LogMiner with <code>redo_log_catalog</code> strategy is confirmed as the CDC mechanism for all domains. XStream is not applicable.</p>
+  </li>
+  <li>
+    <p><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Green</ac:parameter><ac:parameter ac:name="title">RESOLVED</ac:parameter></ac:structured-macro> <strong>Network topology</strong><br/>
+    Two <strong>on-premises data centres</strong> (primary DC + DR DC). Architectural implications:</p>
+    <ul>
+      <li>Kafka cluster spans both DCs: <strong>3 brokers in primary DC + 2 brokers in DR DC</strong> (5-node cluster, rack-aware replication, <code>min.insync.replicas=2</code>)</li>
+      <li>Debezium connectors run in primary DC against the primary Oracle 12c instance</li>
+      <li><strong>Kafka MirrorMaker 2</strong> replicates all CDC topics from primary Kafka to a passive DR Kafka cluster for failover capability</li>
+      <li>JDBC sink connectors write to Oracle 19c primary; Oracle 19c DR is handled by <strong>Oracle Data Guard</strong> — the CDC pipeline does not replicate directly to the DR Oracle instance</li>
+      <li>See the two-DC note in Section 13 for updated infrastructure sizing</li>
+    </ul>
+  </li>
+  <li>
+    <p><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Green</ac:parameter><ac:parameter ac:name="title">RESOLVED</ac:parameter></ac:structured-macro> <strong>Oracle version of legacy DB</strong><br/>
+    Legacy DB is Oracle <strong>12c</strong>, new DB is Oracle <strong>19c</strong>. Full version-specific guidance in Section 4.</p>
+  </li>
+  <li>
+    <p><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Green</ac:parameter><ac:parameter ac:name="title">RESOLVED</ac:parameter></ac:structured-macro> <strong>Procedure inventory size</strong><br/>
+    <strong>&gt; 1 000 packages and procedures</strong> confirmed. The original 2 person-week estimate is insufficient. Updated approach:</p>
+    <ul>
+      <li>Use Oracle <strong>PL/Scope</strong> (<code>ALTER SESSION SET PLSCOPE_SETTINGS='IDENTIFIERS:ALL'</code>) to automatically extract procedure call graphs and DML footprint</li>
+      <li>Supplement with <code>ALL_SOURCE</code>, <code>ALL_DEPENDENCIES</code>, and <code>ALL_OBJECTS</code> queries for full coverage</li>
+      <li>Revised effort: <strong>4&ndash;6 person-weeks</strong> with one dedicated analyst</li>
+      <li>Phase 0 updated to include PL/Scope tooling setup before manual classification begins</li>
+    </ul>
+  </li>
+  <li>
+    <p><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">DEFERRED</ac:parameter></ac:structured-macro> <strong>Bidirectional domains</strong><br/>
+    No domains are pre-designated as bidirectional. Sync direction will be assessed <strong>per domain during Phase 4</strong> handover planning based on migration readiness at that time. Constraints that apply regardless:</p>
+    <ul>
+      <li>Financial tables (contributions, debts, pensions) remain <strong>strictly one-way</strong> (legacy &rarr; new) until full cutover &mdash; no exceptions</li>
+      <li>Any domain proposed for bidirectional sync must pass a conflict-resolution design review before Phase 4 activation</li>
+    </ul>
+  </li>
+  <li>
+    <p><ac:structured-macro ac:name="status"><ac:parameter ac:name="colour">Yellow</ac:parameter><ac:parameter ac:name="title">PARTIAL</ac:parameter></ac:structured-macro> <strong>Compliance scope (PII data map)</strong><br/>
+    DPO audit is <strong>in progress</strong>. Known PII-bearing schemas based on current analysis:</p>
+    <table>
+      <thead><tr><th>Schema</th><th>PII Fields Present</th></tr></thead>
+      <tbody>
+        <tr><td>INSURED / PERSONS</td><td>AMKA, full name, date of birth, residential address</td></tr>
+        <tr><td>HEALTH_INSUR / MEDICAL_CLAIMS</td><td>Medical condition codes, diagnosis data, provider details</td></tr>
+        <tr><td>CONTRIBUTIONS / DEBTS</td><td>IBAN (partial), AFM, employer tax registration</td></tr>
+        <tr><td>EMPLOYERS</td><td>AFM, company registration number, authorised representative data</td></tr>
+      </tbody>
+    </table>
+    <ac:structured-macro ac:name="warning">
+      <ac:rich-text-body>
+        <p>The PII masking SMT must be configured and validated <strong>before any domain's topics go live in production</strong>. Full PII data map is a <strong>Phase 0 gate criterion</strong> &mdash; no connector is registered in production until all relevant tables are confirmed in the Table Registry with their masking rules documented.</p>
+      </ac:rich-text-body>
+    </ac:structured-macro>
+  </li>
+</ol>

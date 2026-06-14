@@ -1,0 +1,47 @@
+{
+  "name": "oracle-cdc-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.oracle.OracleConnector",
+
+    "database.hostname": "oracle-db",
+    "database.port": "1521",
+    "database.user": "c##dbzuser",
+    "database.password": "dbzpassword",
+    "database.dbname": "XE",
+    "database.pdb.name": "XEPDB1",
+    "database.connection.adapter": "logminer",
+
+    "topic.prefix": "oracle",
+
+    "table.include.list": "XEPDB1.APP_USER.CUSTOMERS,XEPDB1.APP_USER.ORDERS,XEPDB1.APP_USER.ORDER_ITEMS",
+
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "schema.history.internal.kafka.topic": "_oracle_schema_history",
+    "schema.history.internal.store.only.captured.tables.ddl": "true",
+
+    "decimal.handling.mode": "double",
+    "time.precision.mode": "connect",
+    "tombstones.on.delete": "true",
+
+    "snapshot.mode": "initial",
+    "snapshot.locking.mode": "none",
+
+    "log.mining.strategy": "redo_log_catalog",
+    "log.mining.batch.size.max": "10000",
+    "log.mining.sleep.time.max.ms": "3000",
+    "log.mining.transaction.retention.hours": "1",
+
+    "key.converter": "io.confluent.connect.avro.AvroConverter",
+    "key.converter.schema.registry.url": "http://schema-registry:8081",
+    "value.converter": "io.confluent.connect.avro.AvroConverter",
+    "value.converter.schema.registry.url": "http://schema-registry:8081",
+
+    "transforms": "unwrap,route",
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.drop.tombstones": "false",
+    "transforms.unwrap.delete.handling.mode": "rewrite",
+    "transforms.unwrap.add.fields": "op,table,ts_ms",
+    "transforms.route.type": "org.apache.kafka.connect.transforms.ReplaceField$Value",
+    "transforms.route.renames": "__deleted:is_deleted"
+  }
+}

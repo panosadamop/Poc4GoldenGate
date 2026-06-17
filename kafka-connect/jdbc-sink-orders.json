@@ -7,7 +7,7 @@
     "connection.user": "app_user",
     "connection.password": "app_password",
 
-    "topics": "oracle.XEPDB1.APP_USER.ORDERS",
+    "topics": "oracle.APP_USER.ORDERS",
     "table.name.format": "APP_USER.ORDERS",
 
     "insert.mode": "upsert",

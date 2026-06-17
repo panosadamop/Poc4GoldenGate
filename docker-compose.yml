@@ -2,6 +2,7 @@ services:
   oracle-db:
     image: container-registry.oracle.com/database/express:21.3.0-xe
     container_name: oracle-source
+    restart: unless-stopped
     environment:
       ORACLE_PWD: Oracle_1234
       ORACLE_CHARACTERSET: AL32UTF8
@@ -21,6 +22,7 @@ services:
   oracle-target:
     image: container-registry.oracle.com/database/express:21.3.0-xe
     container_name: oracle-target
+    restart: unless-stopped
     environment:
       ORACLE_PWD: Oracle_1234
       ORACLE_CHARACTERSET: AL32UTF8
@@ -39,6 +41,7 @@ services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     container_name: zookeeper
+    restart: unless-stopped
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -48,6 +51,7 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.6.0
     container_name: kafka
+    restart: unless-stopped
     depends_on:
       - zookeeper
     ports:
@@ -66,6 +70,7 @@ services:
   schema-registry:
     image: confluentinc/cp-schema-registry:7.6.0
     container_name: schema-registry
+    restart: unless-stopped
     depends_on:
       - kafka
     ports:
@@ -78,6 +83,7 @@ services:
     build:
       context: ./kafka-connect
     container_name: kafka-connect
+    restart: unless-stopped
     depends_on:
       - kafka
       - schema-registry
@@ -111,6 +117,7 @@ services:
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
+    restart: unless-stopped
     depends_on:
       - kafka
       - schema-registry

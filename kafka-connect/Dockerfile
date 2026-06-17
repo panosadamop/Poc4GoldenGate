@@ -18,8 +18,11 @@ RUN confluent-hub install --no-prompt \
 # Reuse the bundled ojdbc8 (compatible with JDK 8-17 and Oracle 12c-21c) for:
 #   - JDBC sink connector plugin classpath
 #   - Kafka system classpath (required so DriverManager.getConnection() can find the driver)
+USER root
 RUN OJDBC=$(ls /usr/share/confluent-hub-components/debezium-connector-oracle/ojdbc*.jar | head -1) && \
     cp "$OJDBC" /usr/share/confluent-hub-components/confluentinc-kafka-connect-jdbc/lib/ && \
     rm -f /usr/share/confluent-hub-components/confluentinc-kafka-connect-jdbc/lib/ojdbc17.jar && \
     cp "$OJDBC" /usr/share/java/kafka/ && \
+    mkdir -p /etc/kafka-connect/jars && \
     cp "$OJDBC" /etc/kafka-connect/jars/
+USER appuser

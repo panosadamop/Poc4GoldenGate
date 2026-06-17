@@ -1,9 +1,7 @@
-version: "3.8"
-
 services:
   oracle-db:
     image: container-registry.oracle.com/database/express:21.3.0-xe
-    container_name: oracle-db
+    container_name: oracle-source
     environment:
       ORACLE_PWD: Oracle_1234
       ORACLE_CHARACTERSET: AL32UTF8
@@ -13,6 +11,24 @@ services:
     volumes:
       - oracle-data:/opt/oracle/oradata
       - ./oracle:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "sqlplus", "-L", "sys/Oracle_1234@//localhost:1521/XE as sysdba", "<<<", "SELECT 1 FROM DUAL;"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  oracle-target:
+    image: container-registry.oracle.com/database/express:21.3.0-xe
+    container_name: oracle-target
+    environment:
+      ORACLE_PWD: Oracle_1234
+      ORACLE_CHARACTERSET: AL32UTF8
+    ports:
+      - "1522:1521"
+      - "5501:5500"
+    volumes:
+      - oracle-target-data:/opt/oracle/oradata
     healthcheck:
       test: ["CMD", "sqlplus", "-L", "sys/Oracle_1234@//localhost:1521/XE as sysdba", "<<<", "SELECT 1 FROM DUAL;"]
       interval: 30s
@@ -82,7 +98,7 @@ services:
       CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
       CONNECT_VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
       CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
-      CONNECT_PLUGIN_PATH: /kafka/connect
+      CONNECT_PLUGIN_PATH: /kafka/connect,/usr/share/confluent-hub-components
       CONNECT_LOG4J_ROOT_LOGLEVEL: INFO
       CONNECT_LOG4J_LOGGERS: "org.apache.kafka.connect.runtime.rest=WARN,org.reflections=ERROR"
     healthcheck:
@@ -122,3 +138,4 @@ services:
 
 volumes:
   oracle-data:
+  oracle-target-data:

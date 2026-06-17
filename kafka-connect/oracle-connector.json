@@ -3,7 +3,7 @@
   "config": {
     "connector.class": "io.debezium.connector.oracle.OracleConnector",
 
-    "database.hostname": "oracle-db",
+    "database.hostname": "oracle-source",
     "database.port": "1521",
     "database.user": "c##dbzuser",
     "database.password": "dbzpassword",

@@ -1,6 +1,6 @@
 # Compare row counts and spot-check data between source and target.
 param(
-    [string]$SrcContainer = "oracle-db",
+    [string]$SrcContainer = "oracle-source",
     [string]$TgtContainer = "oracle-target",
     [string]$AppPwd       = "app_password"
 )

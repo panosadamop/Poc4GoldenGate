@@ -1,6 +1,6 @@
 # Fire DML changes on the SOURCE database to generate CDC events.
 param(
-    [string]$Container = "oracle-db",
+    [string]$Container = "oracle-source",
     [string]$AppPwd   = "app_password"
 )
 $ErrorActionPreference = "Stop"

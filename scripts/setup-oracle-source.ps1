@@ -1,7 +1,7 @@
 # Initialise the Oracle SOURCE database (oracle-db container).
 # Run this after the container reports 'healthy'.
 param(
-    [string]$Container = "oracle-db",
+    [string]$Container = "oracle-source",
     [string]$SysPwd   = "Oracle_1234",
     [string]$AppPwd   = "app_password"
 )
